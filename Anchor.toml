@@ -2,8 +2,8 @@
 members = ["."]
 
 [toolchain]
-anchor_version = "0.28.0"
-solana_version = "1.16.16"
+anchor_version = "0.24.2"
+solana_version = "1.9.13"
 
 [features]
 resolution = true
