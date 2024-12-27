@@ -1,0 +1,13 @@
+{
+    "editor.screenReaderAnnounceInlineSuggestion": false,
+    "cloudcode.duetAI.inlineSuggestions.enableAuto": false,
+    "editor.inlineSuggest.edits.experimental.enabled": false,
+    "editor.inlineSuggest.edits.experimental.onlyShowWhenCloseToCursor": false,
+    "editor.inlineSuggest.enabled": false,
+    "rust-analyzer.inlayHints.chainingHints.enable": false,
+    "rust-analyzer.inlayHints.closingBraceHints.enable": false,
+    "rust-analyzer.inlayHints.genericParameterHints.const.enable": false,
+    "rust-analyzer.inlayHints.parameterHints.enable": false,
+    "rust-analyzer.inlayHints.renderColons": false,
+    "rust-analyzer.inlayHints.typeHints.enable": false
+}

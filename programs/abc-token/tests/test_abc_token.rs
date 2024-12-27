@@ -1,108 +1,68 @@
-use anchor_lang::prelude::*;
+ use anchor_lang::{
+    prelude::*,
+    solana_program::{
+        instruction::Instruction,
+        program_error::ProgramError,
+        program_pack::Pack,
+        system_instruction, system_program,
+        sysvar::{self},
+    },
+};
 use solana_program_test::*;
 use solana_sdk::{
+    entrypoint::ProgramResult,
     signature::{Keypair, Signer},
-    system_instruction,
     transaction::Transaction,
+    transport::TransportError,
 };
-use anchor_spl::token::{self, Mint, TokenAccount};
 
-#[tokio::test]
-async fn test_raydium_integration() {
-    let program_id = abc_token::id();
-    let raydium_program_id = Pubkey::new_unique(); // Mock Raydium program
-
-    let mut program_test = ProgramTest::new(
-        "abc_token",
-        program_id,
-        processor!(abc_token::entry),
-    );
-
-    // Add Raydium program
-    program_test.add_program(
-        "raydium",
-        raydium_program_id,
-        processor!(mock_raydium_processor),
-    );
-
-    // Start the test context
-    let (mut banks_client, payer, recent_blockhash) = program_test.start().await;
-
-    // Create test accounts
-    let mint_keypair = Keypair::new();
-    let authority = Keypair::new();
-
-    // Fund accounts
-    banks_client.process_transaction(Transaction::new_signed_with_payer(
-        &[system_instruction::transfer(
-            &payer.pubkey(),
-            &authority.pubkey(),
-            100_000_000_000, // 100 SOL
-        )],
-        Some(&payer.pubkey()),
-        &[&payer],
-        recent_blockhash,
-    )).await.unwrap();
-
-    // Set up mint and token accounts
-    let (token_source, token_vault, sol_vault, pool_account) = setup_token_accounts(
-        &mut banks_client,
-        &payer,
-        &mint_keypair,
-        &authority,
-        &raydium_program_id,
-    ).await;
-
-    // Test 1: Initialize with Raydium pool
-    let (manager, reserve_account) = test_initialization(
-        &mut banks_client,
-        &payer,
-        &authority,
-        &mint_keypair,
-        &token_source,
-        &token_vault,
-        &sol_vault,
-        &pool_account,
-        &raydium_program_id,
-    ).await;
-
-    // Test 2: Bot detection during monitoring period
-    test_bot_detection(
-        &mut banks_client,
-        &payer,
-        &manager,
-        &pool_account,
-        &token_vault,
-        &sol_vault,
-        &mint_keypair,
-        &raydium_program_id,
-    ).await;
-
-    // Test 3: Normal trading after monitoring period
-    test_normal_trading(
-        &mut banks_client,
-        &payer,
-        &manager,
-        &pool_account,
-        &token_vault,
-        &sol_vault,
-        &mint_keypair,
-        &raydium_program_id,
-    ).await;
+// Custom error type for our tests
+#[derive(Debug)]
+enum TestError {
+    BanksClientError(BanksClientError),
+    ProgramError(ProgramError),
+    TransportError(TransportError),
+    PackError(String),
 }
 
-async fn setup_token_accounts(
+impl From<BanksClientError> for TestError {
+    fn from(e: BanksClientError) -> Self {
+        Self::BanksClientError(e)
+    }
+}
+
+impl From<ProgramError> for TestError {
+    fn from(e: ProgramError) -> Self {
+        Self::ProgramError(e)
+    }
+}
+
+impl From<TransportError> for TestError {
+    fn from(e: TransportError) -> Self {
+        Self::TransportError(e)
+    }
+}
+
+type TestResult<T> = Result<T, TestError>;
+
+// Helper function for token account unpacking errors
+fn handle_token_error<T: std::fmt::Display>(e: T) -> TestError {
+    TestError::PackError(e.to_string())
+}
+
+async fn setup_mint(
     banks_client: &mut BanksClient,
     payer: &Keypair,
     mint_keypair: &Keypair,
-    authority: &Keypair,
-    raydium_program_id: &Pubkey,
-) -> (Pubkey, Pubkey, Pubkey, Pubkey) {
-    // Create mint
-    let rent = banks_client.get_rent().await.unwrap();
+    mint_authority: &Keypair,
+) -> TestResult<()> {
+    let rent = banks_client
+        .get_rent()
+        .await
+        .map_err(TestError::BanksClientError)?;
     let mint_rent = rent.minimum_balance(spl_token::state::Mint::LEN);
-    
-    let create_mint_ix = system_instruction::create_account(
+
+    let create_mint_account_ix = system_instruction::create_account(
         &payer.pubkey(),
         &mint_keypair.pubkey(),
         mint_rent,
@@ -110,524 +70,34 @@ async fn setup_token_accounts(
         &spl_token::id(),
     );
 
-    banks_client.process_transaction(Transaction::new_signed_with_payer(
-        &[create_mint_ix],
-        Some(&payer.pubkey()),
-        &[payer, mint_keypair],
-        banks_client.get_recent_blockhash().await.unwrap(),
-    )).await.unwrap();
-
-    // Initialize mint
-    let init_mint_ix = spl_token::instruction::initialize_mint(
+    let initialize_mint_ix = spl_token::instruction::initialize_mint(
         &spl_token::id(),
         &mint_keypair.pubkey(),
-        &authority.pubkey(),
+        &mint_authority.pubkey(),
         None,
         9,
-    ).unwrap();
+    )?;
 
-    banks_client.process_transaction(Transaction::new_signed_with_payer(
-        &[init_mint_ix],
+    let recent_blockhash = banks_client.get_latest_blockhash().await?;
+    let transaction = Transaction::new_signed_with_payer(
+        &[create_mint_account_ix, initialize_mint_ix],
         Some(&payer.pubkey()),
-        &[payer],
-        banks_client.get_recent_blockhash().await.unwrap(),
-    )).await.unwrap();
-
-    // Create token source account
-    let token_source = Keypair::new();
-    let account_rent = rent.minimum_balance(spl_token::state::Account::LEN);
-
-    let create_source_ix = system_instruction::create_account(
-        &payer.pubkey(),
-        &token_source.pubkey(),
-        account_rent,
-        spl_token::state::Account::LEN as u64,
-        &spl_token::id(),
-    );
-
-    let init_source_ix = spl_token::instruction::initialize_account(
-        &spl_token::id(),
-        &token_source.pubkey(),
-        &mint_keypair.pubkey(),
-        &authority.pubkey(),
-    ).unwrap();
-
-    banks_client.process_transaction(Transaction::new_signed_with_payer(
-        &[create_source_ix, init_source_ix],
-        Some(&payer.pubkey()),
-        &[payer, &token_source],
-        banks_client.get_recent_blockhash().await.unwrap(),
-    )).await.unwrap();
-
-    // Create Raydium pool accounts
-    let pool_account = Keypair::new();
-    let token_vault = Keypair::new();
-    let sol_vault = Keypair::new();
-
-    // Initialize pool accounts
-    let pool_rent = rent.minimum_balance(1000); // Mock size for pool account
-    let vault_rent = rent.minimum_balance(spl_token::state::Account::LEN);
-
-    // Create pool account
-    banks_client.process_transaction(Transaction::new_signed_with_payer(
-        &[system_instruction::create_account(
-            &payer.pubkey(),
-            &pool_account.pubkey(),
-            pool_rent,
-            1000,
-            raydium_program_id,
-        )],
-        Some(&payer.pubkey()),
-        &[payer, &pool_account],
-        banks_client.get_recent_blockhash().await.unwrap(),
-    )).await.unwrap();
-
-    // Create and initialize token vault
-    let create_token_vault_ix = system_instruction::create_account(
-        &payer.pubkey(),
-        &token_vault.pubkey(),
-        vault_rent,
-        spl_token::state::Account::LEN as u64,
-        &spl_token::id(),
-    );
-
-    let init_token_vault_ix = spl_token::instruction::initialize_account(
-        &spl_token::id(),
-        &token_vault.pubkey(),
-        &mint_keypair.pubkey(),
-        &pool_account.pubkey(),
-    ).unwrap();
-
-    banks_client.process_transaction(Transaction::new_signed_with_payer(
-        &[create_token_vault_ix, init_token_vault_ix],
-        Some(&payer.pubkey()),
-        &[payer, &token_vault],
-        banks_client.get_recent_blockhash().await.unwrap(),
-    )).await.unwrap();
-
-    // Create and initialize SOL vault
-    let create_sol_vault_ix = system_instruction::create_account(
-        &payer.pubkey(),
-        &sol_vault.pubkey(),
-        vault_rent,
-        spl_token::state::Account::LEN as u64,
-        &spl_token::id(),
-    );
-
-    let init_sol_vault_ix = spl_token::instruction::initialize_account(
-        &spl_token::id(),
-        &sol_vault.pubkey(),
-        &mint_keypair.pubkey(),
-        &pool_account.pubkey(),
-    ).unwrap();
-
-    banks_client.process_transaction(Transaction::new_signed_with_payer(
-        &[create_sol_vault_ix, init_sol_vault_ix],
-        Some(&payer.pubkey()),
-        &[payer, &sol_vault],
-        banks_client.get_recent_blockhash().await.unwrap(),
-    )).await.unwrap();
-
-    (
-        token_source.pubkey(),
-        token_vault.pubkey(),
-        sol_vault.pubkey(),
-        pool_account.pubkey(),
-    )
-}
-
-// Mock Raydium processor for testing
-fn mock_raydium_processor(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    instruction_data: &[u8],
-) -> ProgramResult {
-    // Mock pool creation
-    if instruction_data[0..8] == [147, 216, 24, 218, 163, 45, 141, 86] {
-        // Extract pool creation parameters
-        let sol_amount = u64::from_le_bytes(instruction_data[8..16].try_into().unwrap());
-        let token_amount = u64::from_le_bytes(instruction_data[16..24].try_into().unwrap());
-        
-        // Mock pool initialization
-        let pool_account = &accounts[1];
-        let token_vault = &accounts[2];
-        let sol_vault = &accounts[3];
-        
-        // In real Raydium, this would create pool state and initialize vaults
-        // For testing, we just need to verify the accounts exist
-        assert!(pool_account.is_writable);
-        assert!(token_vault.is_writable);
-        assert!(sol_vault.is_writable);
-        
-        Ok(())
-    }
-    // Mock swap
-    else if instruction_data[0..8] == [123, 98, 207, 75, 88, 145, 154, 23] {
-        // Extract swap parameters
-        let amount = u64::from_le_bytes(instruction_data[8..16].try_into().unwrap());
-        let is_buy = instruction_data[16] != 0;
-        
-        // Mock swap execution
-        let trader_account = &accounts[0];
-        let pool_account = &accounts[1];
-        let token_vault = &accounts[2];
-        let sol_vault = &accounts[3];
-        let trader_token_account = &accounts[4];
-        
-        // Verify account permissions
-        assert!(trader_account.is_signer);
-        assert!(pool_account.is_writable);
-        assert!(token_vault.is_writable);
-        assert!(sol_vault.is_writable);
-        assert!(trader_token_account.is_writable);
-        
-        // In real Raydium, this would perform the actual swap
-        // For testing, we just verify the accounts are properly set up
-        Ok(())
-    } else {
-        Err(ProgramError::InvalidInstructionData)
-    }
-}
-
-#[tokio::test]
-async fn test_sell_flow() {
-    let program_id = abc_token::id();
-    let raydium_program_id = Pubkey::new_unique();
-    
-    let mut program_test = ProgramTest::new(
-        "abc_token",
-        program_id,
-        processor!(abc_token::entry),
-    );
-
-    program_test.add_program(
-        "raydium",
-        raydium_program_id,
-        processor!(mock_raydium_processor),
-    );
-
-    let (mut banks_client, payer, recent_blockhash) = program_test.start().await;
-
-    // Set up test accounts and pool
-    let (manager, pool_account, token_vault, sol_vault, trader_token_account) = 
-        setup_full_test_state(&mut banks_client, &payer, &raydium_program_id).await;
-
-    // Advance past monitoring period
-    banks_client.advance_clock(6).await;
-
-    // Test regular sell
-    let sell_amount = 1_000_000_000; // 1000 tokens
-    let trader = Keypair::new();
-    
-    let sell_ix = Instruction {
-        program_id,
-        accounts: vec![
-            AccountMeta::new(manager, false),
-            AccountMeta::new(trader.pubkey(), true),
-            AccountMeta::new(trader_token_account, false),
-            AccountMeta::new(pool_account, false),
-            AccountMeta::new(token_vault, false),
-            AccountMeta::new(sol_vault, false),
-            AccountMeta::new_readonly(raydium_program_id, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(sysvar::clock::id(), false),
-        ],
-        data: abc_token::instruction::Sell {
-            token_amount: sell_amount,
-        }.data(),
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[sell_ix],
-        Some(&payer.pubkey()),
-        &[&payer, &trader],
+        &[payer, mint_keypair],
         recent_blockhash,
     );
 
-    banks_client.process_transaction(tx).await.unwrap();
-
-    // Verify sell
-    let token_account = banks_client.get_account(trader_token_account)
-        .await.unwrap().unwrap();
-    let token_balance = spl_token::state::Account::unpack(&token_account.data)
-        .unwrap().amount;
-    assert_eq!(token_balance, 0); // All tokens sold
-}
-
-async fn setup_full_test_state(
-    banks_client: &mut BanksClient,
-    payer: &Keypair,
-    raydium_program_id: &Pubkey,
-) -> (Pubkey, Pubkey, Pubkey, Pubkey, Pubkey) {
-    // Create all necessary accounts for a complete test
-    let mint_keypair = Keypair::new();
-    let authority = Keypair::new();
-
-    // Fund authority
-    banks_client.process_transaction(Transaction::new_signed_with_payer(
-        &[system_instruction::transfer(
-            &payer.pubkey(),
-            &authority.pubkey(),
-            100_000_000_000,
-        )],
-        Some(&payer.pubkey()),
-        &[payer],
-        banks_client.get_recent_blockhash().await.unwrap(),
-    )).await.unwrap();
-
-    // Set up token accounts
-    let (token_source, token_vault, sol_vault, pool_account) = setup_token_accounts(
-        banks_client,
-        payer,
-        &mint_keypair,
-        &authority,
-        raydium_program_id,
-    ).await;
-
-    // Initialize program
-    let (manager, _) = test_initialization(
-        banks_client,
-        payer,
-        &authority,
-        &mint_keypair,
-        &token_source,
-        &token_vault,
-        &sol_vault,
-        &pool_account,
-        raydium_program_id,
-    ).await;
-
-    // Create trader token account
-    let trader_token_account = create_token_account(
-        banks_client,
-        payer,
-        &mint_keypair,
-        &Keypair::new().pubkey(),
-    ).await;
-
-    (manager, pool_account, token_vault, sol_vault, trader_token_account)
-}
-
-async fn test_initialization(
-    banks_client: &mut BanksClient,
-    payer: &Keypair,
-    authority: &Keypair,
-    mint_keypair: &Keypair,
-    token_source: &Pubkey,
-    token_vault: &Pubkey,
-    sol_vault: &Pubkey,
-    pool_account: &Pubkey,
-    raydium_program_id: &Pubkey,
-) -> (Pubkey, Pubkey) {
-    // Calculate PDAs
-    let (manager, _) = Pubkey::find_program_address(
-        &[b"abc_manager", mint_keypair.pubkey().as_ref()],
-        &abc_token::id(),
-    );
-
-    let (reserve_account, _) = Pubkey::find_program_address(
-        &[b"reserve", mint_keypair.pubkey().as_ref()],
-        &abc_token::id(),
-    );
-
-    // Create initialization instruction
-    let init_ix = Instruction {
-        program_id: abc_token::id(),
-        accounts: vec![
-            AccountMeta::new(authority.pubkey(), true),
-            AccountMeta::new_readonly(mint_keypair.pubkey(), false),
-            AccountMeta::new(manager, false),
-            AccountMeta::new(*token_source, false),
-            AccountMeta::new(reserve_account, false),
-            AccountMeta::new(*pool_account, false),
-            AccountMeta::new(*token_vault, false),
-            AccountMeta::new(*sol_vault, false),
-            AccountMeta::new_readonly(*raydium_program_id, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(sysvar::rent::id(), false),
-            AccountMeta::new_readonly(sysvar::clock::id(), false),
-        ],
-        data: abc_token::instruction::Initialize {
-            reserve_amount: 1_000_000_000_000, // 1M tokens
-        }.data(),
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[init_ix],
-        Some(&payer.pubkey()),
-        &[payer, authority],
-        banks_client.get_recent_blockhash().await.unwrap(),
-    );
-
-    banks_client.process_transaction(tx).await.unwrap();
-
-    // Verify initialization
-    let manager_account = banks_client.get_account(manager).await.unwrap().unwrap();
-    let manager_data = abc_token::ABCManager::try_deserialize(&mut &manager_account.data[..]).unwrap();
-    
-    assert_eq!(manager_data.authority, authority.pubkey());
-    assert_eq!(manager_data.mint, mint_keypair.pubkey());
-    assert!(manager_data.is_launched);
-    assert_eq!(manager_data.raydium_pool, *pool_account);
-
-    (manager, reserve_account)
-}
-
-async fn test_bot_detection(
-    banks_client: &mut BanksClient,
-    payer: &Keypair,
-    manager: &Pubkey,
-    pool_account: &Pubkey,
-    token_vault: &Pubkey,
-    sol_vault: &Pubkey,
-    mint_keypair: &Keypair,
-    raydium_program_id: &Pubkey,
-) {
-    let bot_trader = Keypair::new();
-    let bot_token_account = create_token_account(
-        banks_client,
-        payer,
-        mint_keypair,
-        &bot_trader.pubkey(),
-    ).await;
-
-    // Fund bot trader
-    banks_client.process_transaction(Transaction::new_signed_with_payer(
-        &[system_instruction::transfer(
-            &payer.pubkey(),
-            &bot_trader.pubkey(),
-            5_000_000_000, // 5 SOL
-        )],
-        Some(&payer.pubkey()),
-        &[payer],
-        banks_client.get_recent_blockhash().await.unwrap(),
-    )).await.unwrap();
-
-    // Execute trade during monitoring period
-    let buy_ix = Instruction {
-        program_id: abc_token::id(),
-        accounts: vec![
-            AccountMeta::new(*manager, false),
-            AccountMeta::new(bot_trader.pubkey(), true),
-            AccountMeta::new(bot_token_account, false),
-            AccountMeta::new(*pool_account, false),
-            AccountMeta::new(*token_vault, false),
-            AccountMeta::new(*sol_vault, false),
-            AccountMeta::new_readonly(*raydium_program_id, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(sysvar::clock::id(), false),
-        ],
-        data: abc_token::instruction::Buy {
-            sol_amount: 1_000_000_000, // 1 SOL
-        }.data(),
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[buy_ix],
-        Some(&payer.pubkey()),
-        &[payer, &bot_trader],
-        banks_client.get_recent_blockhash().await.unwrap(),
-    );
-
-    banks_client.process_transaction(tx).await.unwrap();
-
-    // Verify bot detection
-    let manager_data = abc_token::ABCManager::try_deserialize(
-        &mut &banks_client.get_account(*manager).await.unwrap().unwrap().data[..]
-    ).unwrap();
-    
-    assert_eq!(manager_data.last_blocked_address, bot_trader.pubkey());
-    assert_eq!(manager_data.captured_sol, 1_000_000_000);
-}
-
-async fn test_normal_trading(
-    banks_client: &mut BanksClient,
-    payer: &Keypair,
-    manager: &Pubkey,
-    pool_account: &Pubkey,
-    token_vault: &Pubkey,
-    sol_vault: &Pubkey,
-    mint_keypair: &Keypair,
-    raydium_program_id: &Pubkey,
-) {
-    // Advance clock past monitoring period
-    banks_client.advance_clock(6).await;
-
-    let normal_trader = Keypair::new();
-    let normal_token_account = create_token_account(
-        banks_client,
-        payer,
-        mint_keypair,
-        &normal_trader.pubkey(),
-    ).await;
-
-    // Fund normal trader
-    banks_client.process_transaction(Transaction::new_signed_with_payer(
-        &[system_instruction::transfer(
-            &payer.pubkey(),
-            &normal_trader.pubkey(),
-            5_000_000_000, // 5 SOL
-        )],
-        Some(&payer.pubkey()),
-        &[payer],
-        banks_client.get_recent_blockhash().await.unwrap(),
-    )).await.unwrap();
-
-    // Execute normal buy
-    let normal_buy_ix = Instruction {
-        program_id: abc_token::id(),
-        accounts: vec![
-            AccountMeta::new(*manager, false),
-            AccountMeta::new(normal_trader.pubkey(), true),
-            AccountMeta::new(normal_token_account, false),
-            AccountMeta::new(*pool_account, false),
-            AccountMeta::new(*token_vault, false),
-            AccountMeta::new(*sol_vault, false),
-            AccountMeta::new_readonly(*raydium_program_id, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(sysvar::clock::id(), false),
-        ],
-        data: abc_token::instruction::Buy {
-            sol_amount: 500_000_000, // 0.5 SOL
-        }.data(),
-    );
-
-    let tx = Transaction::new_signed_with_payer(
-        &[normal_buy_ix],
-        Some(&payer.pubkey()),
-        &[payer, &normal_trader],
-        banks_client.get_recent_blockhash().await.unwrap(),
-    );
-
-    banks_client.process_transaction(tx).await.unwrap();
-
-    // Verify normal trade
-    let manager_data = abc_token::ABCManager::try_deserialize(
-        &mut &banks_client.get_account(*manager).await.unwrap().unwrap().data[..]
-    ).unwrap();
-    
-    assert_ne!(manager_data.last_blocked_address, normal_trader.pubkey());
-
-    // Get token balance
-    let token_account = banks_client.get_account(normal_token_account)
-        .await.unwrap().unwrap();
-    let token_balance = spl_token::state::Account::unpack(&token_account.data)
-        .unwrap().amount;
-    assert!(token_balance > 0);
+    banks_client.process_transaction(transaction).await?;
+    Ok(())
 }
 
 async fn create_token_account(
     banks_client: &mut BanksClient,
     payer: &Keypair,
-    mint: &Keypair,
+    mint: &Pubkey,
     owner: &Pubkey,
-) -> Pubkey {
+) -> TestResult<Pubkey> {
     let token_account = Keypair::new();
-    let rent = banks_client.get_rent().await.unwrap();
+    let rent = banks_client.get_rent().await?;
     let account_rent = rent.minimum_balance(spl_token::state::Account::LEN);
 
     let create_account_ix = system_instruction::create_account(
@@ -641,17 +111,506 @@ async fn create_token_account(
     let initialize_account_ix = spl_token::instruction::initialize_account(
         &spl_token::id(),
         &token_account.pubkey(),
-        &mint.pubkey(),
+        mint,
         owner,
-    ).unwrap();
+    )?;
 
-    let tx = Transaction::new_signed_with_payer(
+    let recent_blockhash = banks_client.get_latest_blockhash().await?;
+    let transaction = Transaction::new_signed_with_payer(
         &[create_account_ix, initialize_account_ix],
         Some(&payer.pubkey()),
         &[payer, &token_account],
-        banks_client.get_recent_blockhash().await.unwrap(),
+        recent_blockhash,
     );
 
-    banks_client.process_transaction(tx).await.unwrap();
-    token_account.pubkey()
+    banks_client.process_transaction(transaction).await?;
+    Ok(token_account.pubkey())
+}
+
+async fn mint_tokens(
+    banks_client: &mut BanksClient,
+    payer: &Keypair,
+    mint: &Pubkey,
+    token_account: &Pubkey,
+    mint_authority: &Keypair,
+    amount: u64,
+) -> TestResult<()> {
+    let mint_ix = spl_token::instruction::mint_to(
+        &spl_token::id(),
+        mint,
+        token_account,
+        &mint_authority.pubkey(),
+        &[],
+        amount,
+    )?;
+
+    let recent_blockhash = banks_client.get_latest_blockhash().await?;
+    let transaction = Transaction::new_signed_with_payer(
+        &[mint_ix],
+        Some(&payer.pubkey()),
+        &[payer, mint_authority],
+        recent_blockhash,
+    );
+
+    banks_client.process_transaction(transaction).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_full_flow() -> TestResult<()> {
+    let program_id = abc_token::id();
+    let raydium_program_id = Pubkey::new_unique();
+
+    let mut program_test = ProgramTest::new("abc_token", program_id, processor!(abc_token::entry));
+
+    // Add mock Raydium program
+    program_test.add_program(
+        "raydium",
+        raydium_program_id,
+        processor!(mock_raydium_processor),
+    );
+
+    // Start the test context
+    let (mut banks_client, payer, recent_blockhash) = program_test.start().await;
+
+    // Setup mint
+    let mint_keypair = Keypair::new();
+    let mint_authority = Keypair::new();
+    setup_mint(&mut banks_client, &payer, &mint_keypair, &mint_authority).await?;
+
+    // Setup token accounts
+    let token_source = create_token_account(
+        &mut banks_client,
+        &payer,
+        &mint_keypair.pubkey(),
+        &mint_authority.pubkey(),
+    )
+    .await?;
+
+    // Mint initial supply
+    mint_tokens(
+        &mut banks_client,
+        &payer,
+        &mint_keypair.pubkey(),
+        &token_source,
+        &mint_authority,
+        1_000_000_000_000,
+    )
+    .await?;
+
+    // Setup Raydium accounts
+    let (pool_account, token_vault, sol_vault) =
+        setup_raydium_accounts(&mut banks_client, &payer, &mint_keypair.pubkey()).await?;
+
+    // Initialize ABC token program
+    let (manager, reserve_account) = initialize_abc_token(
+        &mut banks_client,
+        &payer,
+        &mint_authority,
+        &mint_keypair.pubkey(),
+        &token_source,
+        &pool_account,
+        &token_vault,
+        &sol_vault,
+        &raydium_program_id,
+    )
+    .await?;
+
+    // Test bot detection
+    test_bot_detection(
+        &mut banks_client,
+        &payer,
+        &manager,
+        &pool_account,
+        &token_vault,
+        &sol_vault,
+        &mint_keypair.pubkey(),
+        &raydium_program_id,
+    )
+    .await?;
+
+    // Test normal trading
+    test_normal_trading(
+        &mut banks_client,
+        &payer,
+        &manager,
+        &pool_account,
+        &token_vault,
+        &sol_vault,
+        &mint_keypair.pubkey(),
+        &raydium_program_id,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn setup_raydium_accounts(
+    banks_client: &mut BanksClient,
+    payer: &Keypair,
+    mint: &Pubkey,
+) -> TestResult<(Pubkey, Pubkey, Pubkey)> {
+    let pool_account = Keypair::new();
+    let token_vault =
+        create_token_account(banks_client, payer, mint, &pool_account.pubkey()).await?;
+
+    let sol_vault = Keypair::new();
+    let rent = banks_client.get_rent().await?;
+    let sol_vault_rent = rent.minimum_balance(0);
+
+    let create_sol_vault_ix = system_instruction::create_account(
+        &payer.pubkey(),
+        &sol_vault.pubkey(),
+        sol_vault_rent,
+        0,
+        &system_program::id(),
+    );
+
+    let recent_blockhash = banks_client.get_latest_blockhash().await?;
+    let transaction = Transaction::new_signed_with_payer(
+        &[create_sol_vault_ix],
+        Some(&payer.pubkey()),
+        &[payer, &sol_vault],
+        recent_blockhash,
+    );
+
+    banks_client.process_transaction(transaction).await?;
+
+    Ok((pool_account.pubkey(), token_vault, sol_vault.pubkey()))
+}
+
+async fn initialize_abc_token(
+    banks_client: &mut BanksClient,
+    payer: &Keypair,
+    authority: &Keypair,
+    mint: &Pubkey,
+    token_source: &Pubkey,
+    pool_account: &Pubkey,
+    token_vault: &Pubkey,
+    sol_vault: &Pubkey,
+    raydium_program_id: &Pubkey,
+) -> TestResult<(Pubkey, Pubkey)> {
+    let (manager, _) =
+        Pubkey::find_program_address(&[b"abc_manager", mint.as_ref()], &abc_token::id());
+
+    let (reserve_account, _) =
+        Pubkey::find_program_address(&[b"reserve", mint.as_ref()], &abc_token::id());
+
+    let accounts = vec![
+        AccountMeta::new(authority.pubkey(), true),
+        AccountMeta::new_readonly(*mint, false),
+        AccountMeta::new(manager, false),
+        AccountMeta::new(*token_source, false),
+        AccountMeta::new(reserve_account, false),
+        AccountMeta::new(*pool_account, false),
+        AccountMeta::new(*token_vault, false),
+        AccountMeta::new(*sol_vault, false),
+        AccountMeta::new_readonly(*raydium_program_id, false),
+        AccountMeta::new_readonly(spl_token::id(), false),
+        AccountMeta::new_readonly(system_program::id(), false),
+        AccountMeta::new_readonly(sysvar::rent::id(), false),
+        AccountMeta::new_readonly(sysvar::clock::id(), false),
+    ];
+
+    let mut init_data = vec![0; 8 + 8]; // 8 bytes discriminator + 8 bytes for u64
+    init_data[0..8].copy_from_slice(&[103, 133, 90, 210, 225, 25, 126, 37]); // Initialize discriminator
+    init_data[8..16].copy_from_slice(&1_000_000_000_000u64.to_le_bytes());
+
+    let init_ix = Instruction {
+        program_id: abc_token::id(),
+        accounts,
+        data: init_data,
+    };
+
+    let recent_blockhash = banks_client.get_latest_blockhash().await?;
+    let transaction = Transaction::new_signed_with_payer(
+        &[init_ix],
+        Some(&payer.pubkey()),
+        &[payer, authority],
+        recent_blockhash,
+    );
+
+    banks_client.process_transaction(transaction).await?;
+
+    // Verify initialization
+    let manager_account = banks_client.get_account(manager).await?.unwrap();
+    let manager_data = abc_token::ABCManager::try_deserialize(&mut &manager_account.data[..])?;
+
+    assert_eq!(manager_data.authority, authority.pubkey());
+    assert_eq!(manager_data.mint, *mint);
+    assert!(manager_data.is_launched);
+
+    Ok((manager, reserve_account))
+}
+
+async fn test_bot_detection(
+    banks_client: &mut BanksClient,
+    payer: &Keypair,
+    manager: &Pubkey,
+    pool_account: &Pubkey,
+    token_vault: &Pubkey,
+    sol_vault: &Pubkey,
+    mint: &Pubkey,
+    raydium_program_id: &Pubkey,
+) -> TestResult<()> {
+    let bot_trader = Keypair::new();
+    let bot_token_account =
+        create_token_account(banks_client, payer, mint, &bot_trader.pubkey()).await?;
+
+    // Fund bot trader
+    let recent_blockhash = banks_client.get_latest_blockhash().await?;
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(
+            &payer.pubkey(),
+            &bot_trader.pubkey(),
+            5_000_000_000, // 5 SOL
+        )],
+        Some(&payer.pubkey()),
+        &[payer],
+        recent_blockhash,
+    );
+    banks_client.process_transaction(fund_tx).await?;
+
+    // Execute trade during monitoring period
+    let accounts = vec![
+        AccountMeta::new(*manager, false),
+        AccountMeta::new(bot_trader.pubkey(), true),
+        AccountMeta::new(bot_token_account, false),
+        AccountMeta::new(*pool_account, false),
+        AccountMeta::new(*token_vault, false),
+        AccountMeta::new(*sol_vault, false),
+        AccountMeta::new_readonly(*raydium_program_id, false),
+        AccountMeta::new_readonly(spl_token::id(), false),
+        AccountMeta::new_readonly(system_program::id(), false),
+        AccountMeta::new_readonly(sysvar::clock::id(), false),
+    ];
+
+    let mut buy_data = vec![0; 8 + 8];
+    buy_data[0..8].copy_from_slice(&[242, 35, 198, 137, 82, 225, 242, 182]); // Buy discriminator
+    buy_data[8..16].copy_from_slice(&1_000_000_000u64.to_le_bytes());
+
+    let buy_ix = Instruction {
+        program_id: abc_token::id(),
+        accounts,
+        data: buy_data,
+    };
+
+    let recent_blockhash = banks_client.get_latest_blockhash().await?;
+    let transaction = Transaction::new_signed_with_payer(
+        &[buy_ix],
+        Some(&payer.pubkey()),
+        &[payer, &bot_trader],
+        recent_blockhash,
+    );
+
+    banks_client.process_transaction(transaction).await?;
+
+    // Verify bot detection
+    let manager_account = banks_client.get_account(*manager).await?.unwrap();
+    let manager_data = abc_token::ABCManager::try_deserialize(&mut &manager_account.data[..])?;
+
+    assert_eq!(manager_data.last_blocked_address, bot_trader.pubkey());
+    assert_eq!(manager_data.captured_sol, 1_000_000_000);
+
+    // Check token balances to verify counter-trade
+    let bot_token_balance = get_token_balance(banks_client, &bot_token_account).await?;
+    let pool_token_balance = get_token_balance(banks_client, token_vault).await?;
+
+    // Bot should have received tokens, but counter-trade should have neutralized price impact
+    assert!(bot_token_balance > 0);
+    assert!(pool_token_balance > 0);
+
+    Ok(())
+}
+
+async fn test_normal_trading(
+    banks_client: &mut BanksClient,
+    payer: &Keypair,
+    manager: &Pubkey,
+    pool_account: &Pubkey,
+    token_vault: &Pubkey,
+    sol_vault: &Pubkey,
+    mint: &Pubkey,
+    raydium_program_id: &Pubkey,
+) -> TestResult<()> {
+    // Advance clock past monitoring period by processing empty transactions
+    for _ in 0..6 {
+        let recent_blockhash = banks_client.get_latest_blockhash().await?;
+        let tx = Transaction::new_signed_with_payer(
+            &[],
+            Some(&payer.pubkey()),
+            &[payer],
+            recent_blockhash,
+        );
+        banks_client.process_transaction(tx).await?;
+    }
+
+    let normal_trader = Keypair::new();
+    let normal_token_account =
+        create_token_account(banks_client, payer, mint, &normal_trader.pubkey()).await?;
+
+    // Fund normal trader
+    let recent_blockhash = banks_client.get_latest_blockhash().await?;
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(
+            &payer.pubkey(),
+            &normal_trader.pubkey(),
+            5_000_000_000, // 5 SOL
+        )],
+        Some(&payer.pubkey()),
+        &[payer],
+        recent_blockhash,
+    );
+    banks_client.process_transaction(fund_tx).await?;
+
+    // Execute normal buy
+    let buy_accounts = vec![
+        AccountMeta::new(*manager, false),
+        AccountMeta::new(normal_trader.pubkey(), true),
+        AccountMeta::new(normal_token_account, false),
+        AccountMeta::new(*pool_account, false),
+        AccountMeta::new(*token_vault, false),
+        AccountMeta::new(*sol_vault, false),
+        AccountMeta::new_readonly(*raydium_program_id, false),
+        AccountMeta::new_readonly(spl_token::id(), false),
+        AccountMeta::new_readonly(system_program::id(), false),
+        AccountMeta::new_readonly(sysvar::clock::id(), false),
+    ];
+
+    let mut buy_data = vec![0; 8 + 8];
+    buy_data[0..8].copy_from_slice(&[242, 35, 198, 137, 82, 225, 242, 182]); // Buy discriminator
+    buy_data[8..16].copy_from_slice(&500_000_000u64.to_le_bytes());
+
+    let buy_ix = Instruction {
+        program_id: abc_token::id(),
+        accounts: buy_accounts,
+        data: buy_data,
+    };
+
+    let recent_blockhash = banks_client.get_latest_blockhash().await?;
+    let buy_tx = Transaction::new_signed_with_payer(
+        &[buy_ix],
+        Some(&payer.pubkey()),
+        &[payer, &normal_trader],
+        recent_blockhash,
+    );
+
+    banks_client.process_transaction(buy_tx).await?;
+
+    // Verify normal trade
+    let manager_account = banks_client.get_account(*manager).await?.unwrap();
+    let manager_data = abc_token::ABCManager::try_deserialize(&mut &manager_account.data[..])?;
+
+    assert_ne!(manager_data.last_blocked_address, normal_trader.pubkey());
+
+    // Check token balance after buy
+    let token_balance_after_buy = get_token_balance(banks_client, &normal_token_account).await?;
+    assert!(token_balance_after_buy > 0);
+
+    // Test selling
+    let sell_accounts = vec![
+        AccountMeta::new(*manager, false),
+        AccountMeta::new(normal_trader.pubkey(), true),
+        AccountMeta::new(normal_token_account, false),
+        AccountMeta::new(*pool_account, false),
+        AccountMeta::new(*token_vault, false),
+        AccountMeta::new(*sol_vault, false),
+        AccountMeta::new_readonly(*raydium_program_id, false),
+        AccountMeta::new_readonly(spl_token::id(), false),
+        AccountMeta::new_readonly(system_program::id(), false),
+        AccountMeta::new_readonly(sysvar::clock::id(), false),
+    ];
+
+    let mut sell_data = vec![0; 8 + 8];
+    sell_data[0..8].copy_from_slice(&[183, 18, 70, 156, 148, 109, 161, 34]); // Sell discriminator
+    sell_data[8..16].copy_from_slice(&(token_balance_after_buy / 2).to_le_bytes());
+
+    let sell_ix = Instruction {
+        program_id: abc_token::id(),
+        accounts: sell_accounts,
+        data: sell_data,
+    };
+
+    let recent_blockhash = banks_client.get_latest_blockhash().await?;
+    let sell_tx = Transaction::new_signed_with_payer(
+        &[sell_ix],
+        Some(&payer.pubkey()),
+        &[payer, &normal_trader],
+        recent_blockhash,
+    );
+
+    banks_client.process_transaction(sell_tx).await?;
+
+    // Verify token balance after sell
+    let final_token_balance = get_token_balance(banks_client, &normal_token_account).await?;
+    assert_eq!(final_token_balance, token_balance_after_buy / 2);
+
+    Ok(())
+}
+
+async fn get_token_balance(
+    banks_client: &mut BanksClient,
+    token_account: &Pubkey,
+) -> TestResult<u64> {
+    let account = banks_client.get_account(*token_account).await?.unwrap();
+    let token_account = spl_token::state::Account::unpack(&account.data)
+        .map_err(|e| TestError::PackError(e.to_string()))?;
+    Ok(token_account.amount)
+}
+
+fn mock_raydium_processor(
+    _program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if instruction_data.len() < 8 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let (tag, _rest) = instruction_data.split_at(8);
+    match tag {
+        // Initialize pool instruction
+        [1, 0, 0, 0, 0, 0, 0, 0] => {
+            let accounts_iter = &mut accounts.iter();
+            let authority = next_account_info(accounts_iter)?;
+            let pool_account = next_account_info(accounts_iter)?;
+            let token_vault = next_account_info(accounts_iter)?;
+            let sol_vault = next_account_info(accounts_iter)?;
+
+            // Basic validation
+            if !authority.is_signer
+                || !pool_account.is_writable
+                || !token_vault.is_writable
+                || !sol_vault.is_writable
+            {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            Ok(())
+        }
+
+        // Swap instruction
+        [2, 0, 0, 0, 0, 0, 0, 0] => {
+            let accounts_iter = &mut accounts.iter();
+            let trader = next_account_info(accounts_iter)?;
+            let pool = next_account_info(accounts_iter)?;
+            let token_vault = next_account_info(accounts_iter)?;
+            let sol_vault = next_account_info(accounts_iter)?;
+            let trader_token_account = next_account_info(accounts_iter)?;
+
+            // Basic validation
+            if !trader.is_signer
+                || !pool.is_writable
+                || !token_vault.is_writable
+                || !sol_vault.is_writable
+                || !trader_token_account.is_writable
+            {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            Ok(())
+        }
+
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
 }

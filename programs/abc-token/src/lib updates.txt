@@ -1,0 +1,242 @@
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+use std::str::FromStr;
+use solana_program::{system_instruction, instruction::Instruction};
+use anchor_lang::{solana_program::program::{invoke, invoke_signed}, prelude::Signer};
+
+declare_id!("vBcHBCoQLGDvKejC5MHEZW4pLZi17FS8qPtyA2S6NVt");
+
+// Constants moved to a separate section for better organization
+pub mod constants {
+    pub const MONITORING_BLOCKS: u64 = 5;
+    pub const MIN_TRADE_SOL: u64 = 100_000; // 0.0001 SOL
+    pub const MAX_TRADE_SOL: u64 = 1_000_000_000; // 1 SOL
+    pub const RAYDIUM_PROGRAM_ID: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+    pub const MAX_PRICE_IMPACT_BPS: u64 = 1000; // 10%
+    pub const SLIPPAGE_TOLERANCE_BPS: u64 = 100; // 1%
+}
+
+use constants::*;
+
+// Program module with allow attribute to suppress Result size warning
+#[program]
+#[allow(clippy::result_large_err)]
+pub mod abc_token {
+    use super::*;
+
+    pub fn initialize(ctx: Context<Initialize>, reserve_amount: u64) -> Result<()> {
+        let manager = &mut ctx.accounts.manager;
+        let clock = Clock::get()?;
+
+        manager.initialize(
+            ctx.accounts.authority.key(),
+            ctx.accounts.mint.key(),
+            clock.slot,
+            reserve_amount,
+            *ctx.bumps.get("manager").unwrap(),
+            ctx.accounts.token_vault.key(),
+        );
+
+        // Transfer initial reserve tokens
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.token_source.to_account_info(),
+                    to: ctx.accounts.reserve_account.to_account_info(),
+                    authority: ctx.accounts.authority.to_account_info(),
+                },
+            ),
+            reserve_amount,
+        )?;
+
+        // Create Raydium pool
+        create_and_initialize_pool(
+            ctx,
+            reserve_amount / 2, // 50% of reserve as initial liquidity
+            MIN_TRADE_SOL,
+        )?;
+
+        emit!(ProgramInitialized {
+            launch_slot: manager.launch_slot,
+            reserve_amount,
+            raydium_pool: ctx.accounts.token_vault.key(),
+        });
+
+        Ok(())
+    }
+
+    // Buy entry point with cleaner error handling
+    pub fn buy(ctx: Context<Trade>, sol_amount: u64) -> Result<()> {
+        let clock = Clock::get()?;
+        
+        if ctx.accounts.manager.is_in_monitoring_period(clock.slot) {
+            process_monitored_buy(ctx, sol_amount)
+        } else {
+            process_regular_buy(ctx, sol_amount)
+        }
+    }
+
+    // Sell entry point with validation
+    pub fn sell(ctx: Context<Trade>, token_amount: u64) -> Result<()> {
+        require!(
+            !ctx.accounts.manager.is_in_monitoring_period(Clock::get()?.slot),
+            ErrorCode::TradingNotActive
+        );
+
+        trade::process_sell(ctx, token_amount)
+    }
+}
+
+// Implementation methods for accounts
+impl ABCManager {
+    pub fn initialize(
+        &mut self,
+        authority: Pubkey,
+        mint: Pubkey,
+        launch_slot: u64,
+        reserve_amount: u64,
+        bump: u8,
+        raydium_pool: Pubkey,
+    ) {
+        self.authority = authority;
+        self.mint = mint;
+        self.launch_slot = launch_slot;
+        self.is_launched = true;
+        self.captured_sol = 0;
+        self.reserve_tokens = reserve_amount;
+        self.bump = bump;
+        self.last_blocked_address = Pubkey::default();
+        self.raydium_pool = raydium_pool;
+    }
+
+    pub fn is_in_monitoring_period(&self, current_slot: u64) -> bool {
+        current_slot <= self.launch_slot + MONITORING_BLOCKS
+    }
+
+    pub fn update_bot_capture(&mut self, bot_address: Pubkey, sol_amount: u64) -> Result<()> {
+        self.last_blocked_address = bot_address;
+        self.captured_sol = self.captured_sol
+            .checked_add(sol_amount)
+            .ok_or(ErrorCode::MathOverflow)?;
+        Ok(())
+    }
+}
+
+// Separate module for trading logic
+mod trade {
+    use super::*;
+
+    pub fn process_regular_buy(ctx: Context<Trade>, sol_amount: u64) -> Result<()> {
+        validate_trade_amount(sol_amount)?;
+        execute_raydium_swap(&ctx, sol_amount, true)?;
+
+        let tokens_out = pricing::calculate_tokens_from_sol(sol_amount)?;
+        
+        emit!(TradeExecuted {
+            trader: ctx.accounts.trader.key(),
+            is_buy: true,
+            sol_amount,
+            token_amount: tokens_out,
+            slot: Clock::get()?.slot,
+        });
+
+        Ok(())
+    }
+
+    pub fn process_monitored_buy(ctx: Context<Trade>, sol_amount: u64) -> Result<()> {
+        ctx.accounts.manager.update_bot_capture(
+            ctx.accounts.trader.key(),
+            sol_amount,
+        )?;
+
+        let tokens_out = pricing::calculate_tokens_from_sol(sol_amount)?;
+        
+        // Counter trade through Raydium
+        execute_raydium_swap(&ctx, tokens_out, false)?;
+
+        emit!(BotPurchaseHandled {
+            bot_address: ctx.accounts.trader.key(),
+            tokens_purchased: tokens_out,
+            sol_captured: sol_amount,
+            tokens_sold: tokens_out,
+            slot: Clock::get()?.slot,
+        });
+
+        Ok(())
+    }
+
+    pub fn process_sell(ctx: Context<Trade>, token_amount: u64) -> Result<()> {
+        validate_trade_amount(pricing::calculate_sol_from_tokens(token_amount)?)?;
+        execute_raydium_swap(&ctx, token_amount, false)?;
+
+        emit!(TradeExecuted {
+            trader: ctx.accounts.trader.key(),
+            is_buy: false,
+            sol_amount: pricing::calculate_sol_from_tokens(token_amount)?,
+            token_amount,
+            slot: Clock::get()?.slot,
+        });
+
+        Ok(())
+    }
+
+    fn validate_trade_amount(amount: u64) -> Result<()> {
+        require!(amount >= MIN_TRADE_SOL, ErrorCode::TradeTooSmall);
+        require!(amount <= MAX_TRADE_SOL, ErrorCode::TradeTooLarge);
+        Ok(())
+    }
+}
+
+// Separate module for pricing calculations
+mod pricing {
+    use super::*;
+
+    pub fn calculate_tokens_from_sol(sol_amount: u64) -> Result<u64> {
+        let sol_reserve: u128 = 1_000_000_000;
+        let token_reserve: u128 = 1_000_000_000_000;
+        
+        calculate_swap_output(
+            sol_amount,
+            sol_reserve,
+            token_reserve
+        )
+    }
+
+    pub fn calculate_sol_from_tokens(token_amount: u64) -> Result<u64> {
+        let sol_reserve: u128 = 1_000_000_000;
+        let token_reserve: u128 = 1_000_000_000_000;
+        
+        calculate_swap_output(
+            token_amount,
+            token_reserve,
+            sol_reserve
+        )
+    }
+
+    fn calculate_swap_output(
+        amount_in: u64,
+        reserve_in: u128,
+        reserve_out: u128
+    ) -> Result<u64> {
+        let k = reserve_in
+            .checked_mul(reserve_out)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        let new_reserve_in = reserve_in
+            .checked_add(amount_in as u128)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        let new_reserve_out = k
+            .checked_div(new_reserve_in)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        let amount_out = reserve_out
+            .checked_sub(new_reserve_out)
+            .ok_or(ErrorCode::MathOverflow)?;
+
+        Ok(amount_out as u64)
+    }
+}
+
+// Rest of the code (structs, events, errors) remains the same...

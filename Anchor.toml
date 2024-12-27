@@ -1,6 +1,9 @@
+[workspace]
+members = ["."]
+
 [toolchain]
 anchor_version = "0.28.0"
-solana_version = "1.18.26"
+solana_version = "1.16.16"
 
 [features]
 resolution = true
@@ -9,13 +12,15 @@ skip-lint = false
 [programs.localnet]
 abc_token = "vBcHBCoQLGDvKejC5MHEZW4pLZi17FS8qPtyA2S6NVt"
 
+[programs.testnet]
+abc_token = "vBcHBCoQLGDvKejC5MHEZW4pLZi17FS8qPtyA2S6NVt"
+
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "Localnet"
-wallet = "~/.config/solana/id.json"
+cluster = "testnet"
+wallet = "testnet-wallet.json"
 
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
-
